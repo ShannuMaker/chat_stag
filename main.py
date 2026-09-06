@@ -108,7 +108,6 @@ def analyze_frame(img, user_gender):
                 gender_net.setInput(blob)
                 gender_preds = gender_net.forward()[0]
                 
-                # Apply 65% certainty threshold to fix false gender detections
                 male_conf = float(gender_preds[0])
                 female_conf = float(gender_preds[1])
                 
@@ -139,7 +138,7 @@ async def ai_background_worker():
     while True:
         try:
             task = await ai_task_queue.get()
-            client_ip, ws, user_gender, room_id, img = task
+            client_ip, ws, user_gender, room_id, img, raw_image_data = task
             
             if ws.client_state.name != "CONNECTED":
                 ai_task_queue.task_done()
@@ -164,9 +163,9 @@ async def ai_background_worker():
                 pass
 
             if is_nudity:
-                await execute_ban(client_ip, ws, room_id, "Explicit/Nudity content detected.")
+                await execute_ban(client_ip, ws, room_id, "Explicit/Nudity content detected.", raw_image_data)
             elif is_kid:
-                await execute_ban(client_ip, ws, room_id, "Minors are strictly prohibited.")
+                await execute_ban(client_ip, ws, room_id, "Minors are strictly prohibited.", raw_image_data)
             elif not face_found:
                 try: await ws.send_json({"type": "warning", "payload": "⚠️ Warning: Face not visible! Please stay in the camera view."})
                 except Exception: pass
@@ -180,8 +179,8 @@ async def ai_background_worker():
         except Exception:
             ai_task_queue.task_done()
 
-async def execute_ban(client_ip, ws, room_id, reason):
-    await ban_user(client_ip, reason)
+async def execute_ban(client_ip, ws, room_id, reason, image_data=None):
+    await ban_user(client_ip, reason, image_data)
     try:
         await ws.send_json({"type": "error", "payload": f"⛔ Banned: {reason}"})
         await asyncio.sleep(0.2)
@@ -211,7 +210,13 @@ async def startup():
     try:
         db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0, max_inactive_connection_lifetime=300)
         async with db_pool.acquire() as conn:
-            await conn.execute('CREATE TABLE IF NOT EXISTS banned_ips (ip VARCHAR(255) PRIMARY KEY, reason TEXT, is_banned BOOLEAN DEFAULT TRUE)')
+            # Added image_data TEXT column for admin review of minor/nudity flags
+            await conn.execute('CREATE TABLE IF NOT EXISTS banned_ips (ip VARCHAR(255) PRIMARY KEY, reason TEXT, is_banned BOOLEAN DEFAULT TRUE, image_data TEXT)')
+            try:
+                # Alter existing table safely if it was already created without the column
+                await conn.execute('ALTER TABLE banned_ips ADD COLUMN image_data TEXT')
+            except Exception: pass
+            
             await conn.execute('CREATE TABLE IF NOT EXISTS ads (id SERIAL PRIMARY KEY, ad_content TEXT, is_active BOOLEAN DEFAULT TRUE)')
     except Exception: pass
     for _ in range(4): workers.append(asyncio.create_task(ai_background_worker()))
@@ -231,15 +236,15 @@ async def is_banned(ip: str):
         print(f"DB Ban Check Error: {e}")
         return None
 
-async def ban_user(ip: str, reason: str):
+async def ban_user(ip: str, reason: str, image_data: str = None):
     if not db_pool: return
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO banned_ips (ip, reason, is_banned) 
-                VALUES ($1, $2, TRUE) 
-                ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason
-            """, ip, reason)
+                INSERT INTO banned_ips (ip, reason, is_banned, image_data) 
+                VALUES ($1, $2, TRUE, $3) 
+                ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason, image_data = EXCLUDED.image_data
+            """, ip, reason, image_data)
     except Exception as e: 
         print(f"DB Ban Insert Error: {e}")
 
@@ -267,10 +272,13 @@ async def websocket_monitor(websocket: WebSocket):
             return
         while True:
             data = await websocket.receive_json()
-            img = decode_base64_image(data.get("image", ""))
+            raw_image_data = data.get("image", "")
+            img = decode_base64_image(raw_image_data)
             user_gender = data.get("gender", "male").lower()
             current_room = next((user_rooms.get(ws) for ws, ip in client_ips.items() if ip == client_ip), None)
-            await ai_task_queue.put((client_ip, websocket, user_gender, current_room, img))
+            
+            # Pass the raw base64 string directly into the queue
+            await ai_task_queue.put((client_ip, websocket, user_gender, current_room, img, raw_image_data))
     except Exception: pass
 
 @app.websocket("/ws/chat/{gender}")
@@ -296,7 +304,8 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 await websocket.close()
                 return
             
-            img = decode_base64_image(init_data.get("image", ""))
+            raw_image_data = init_data.get("image", "")
+            img = decode_base64_image(raw_image_data)
             
             async with ai_semaphore:
                 face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
@@ -309,7 +318,8 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 return
 
             if is_kid or is_nudity:
-                await ban_user(client_ip, "Policy violation detected on connection.")
+                # Capture the raw image to database directly on start violation
+                await ban_user(client_ip, "Policy violation detected on connection.", raw_image_data)
                 await websocket.send_json({"type": "error", "payload": "⛔ Banned: Policy violation."})
                 await websocket.close()
                 return
