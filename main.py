@@ -79,7 +79,7 @@ def analyze_frame(img, user_gender):
         
         for i in range(detections.shape[2]):
             conf = detections[0, 0, i, 2]
-            if conf > 0.50 and conf > max_conf:
+            if conf > 0.55 and conf > max_conf: # Slightly stricter face confidence
                 max_conf = conf
                 best_box = (detections[0, 0, i, 3:7] * np.array([w, h, w, h])).astype("int")
                 face_found = True
@@ -100,14 +100,16 @@ def analyze_frame(img, user_gender):
             if face_crop.size > 0:
                 blob = cv2.dnn.blobFromImage(face_crop, 1.0, (227, 227), (78.4, 87.8, 114.9), swapRB=False)
                 
+                # AGE DETECTION (Optimized)
                 age_net.setInput(blob)
                 age_preds = age_net.forward()[0]
-                minor_prob = float(np.sum(age_preds[0:3]))
-                is_kid = bool(minor_prob > 0.50)
+                # Brackets 0-3 cover ages 0 to 20. Require 70% confidence to flag as minor.
+                minor_prob = float(np.sum(age_preds[0:4]))
+                is_kid = bool(minor_prob > 0.70)
                 
+                # GENDER DETECTION (Optimized)
                 gender_net.setInput(blob)
                 gender_preds = gender_net.forward()[0]
-                
                 male_conf = float(gender_preds[0])
                 female_conf = float(gender_preds[1])
                 
@@ -118,16 +120,22 @@ def analyze_frame(img, user_gender):
                 else:
                     predicted_gender = user_gender
             
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        lower_skin = np.array([0, 45, 80], dtype=np.uint8)
-        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_skin, upper_skin)
+        # NUDITY DETECTION (Optimized using YCrCb & Torso Isolation)
+        img_ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+        # YCrCb is highly resistant to lighting changes compared to HSV
+        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+        mask = cv2.inRange(img_ycrcb, lower_skin, upper_skin)
         
         if face_found:
-            mask[y1:y2, x1:x2] = 0 
+            # Black out the face AND neck area to prevent false positives
+            mask[max(0, y1-20):y2, x1:x2] = 0 
         
-        skin_ratio = np.sum(mask > 0) / (h * w)
-        is_nudity = bool(skin_ratio > 0.60) 
+        # Only scan the lower 2/3rds of the screen (chest/torso area)
+        torso_mask = mask[int(h*0.33):h, 0:w]
+        if torso_mask.size > 0:
+            skin_ratio = np.sum(torso_mask > 0) / torso_mask.size
+            is_nudity = bool(skin_ratio > 0.45) # If 45% of torso area is bare skin, flag nudity
         
         return face_found, is_kid, is_nudity, predicted_gender
     except Exception:
@@ -138,7 +146,7 @@ async def ai_background_worker():
     while True:
         try:
             task = await ai_task_queue.get()
-            client_ip, ws, user_gender, room_id, img, raw_image_data = task
+            client_ip, ws, user_gender, room_id, img = task
             
             if ws.client_state.name != "CONNECTED":
                 ai_task_queue.task_done()
@@ -163,9 +171,9 @@ async def ai_background_worker():
                 pass
 
             if is_nudity:
-                await execute_ban(client_ip, ws, room_id, "Explicit/Nudity content detected.", raw_image_data)
+                await execute_ban(client_ip, ws, room_id, "Explicit/Nudity content detected.")
             elif is_kid:
-                await execute_ban(client_ip, ws, room_id, "Minors are strictly prohibited.", raw_image_data)
+                await execute_ban(client_ip, ws, room_id, "Minors are strictly prohibited.")
             elif not face_found:
                 try: await ws.send_json({"type": "warning", "payload": "⚠️ Warning: Face not visible! Please stay in the camera view."})
                 except Exception: pass
@@ -179,8 +187,8 @@ async def ai_background_worker():
         except Exception:
             ai_task_queue.task_done()
 
-async def execute_ban(client_ip, ws, room_id, reason, image_data=None):
-    await ban_user(client_ip, reason, image_data)
+async def execute_ban(client_ip, ws, room_id, reason):
+    await ban_user(client_ip, reason)
     try:
         await ws.send_json({"type": "error", "payload": f"⛔ Banned: {reason}"})
         await asyncio.sleep(0.2)
@@ -210,13 +218,7 @@ async def startup():
     try:
         db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0, max_inactive_connection_lifetime=300)
         async with db_pool.acquire() as conn:
-            # Added image_data TEXT column for admin review of minor/nudity flags
-            await conn.execute('CREATE TABLE IF NOT EXISTS banned_ips (ip VARCHAR(255) PRIMARY KEY, reason TEXT, is_banned BOOLEAN DEFAULT TRUE, image_data TEXT)')
-            try:
-                # Alter existing table safely if it was already created without the column
-                await conn.execute('ALTER TABLE banned_ips ADD COLUMN image_data TEXT')
-            except Exception: pass
-            
+            await conn.execute('CREATE TABLE IF NOT EXISTS banned_ips (ip VARCHAR(255) PRIMARY KEY, reason TEXT, is_banned BOOLEAN DEFAULT TRUE)')
             await conn.execute('CREATE TABLE IF NOT EXISTS ads (id SERIAL PRIMARY KEY, ad_content TEXT, is_active BOOLEAN DEFAULT TRUE)')
     except Exception: pass
     for _ in range(4): workers.append(asyncio.create_task(ai_background_worker()))
@@ -236,15 +238,15 @@ async def is_banned(ip: str):
         print(f"DB Ban Check Error: {e}")
         return None
 
-async def ban_user(ip: str, reason: str, image_data: str = None):
+async def ban_user(ip: str, reason: str):
     if not db_pool: return
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO banned_ips (ip, reason, is_banned, image_data) 
-                VALUES ($1, $2, TRUE, $3) 
-                ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason, image_data = EXCLUDED.image_data
-            """, ip, reason, image_data)
+                INSERT INTO banned_ips (ip, reason, is_banned) 
+                VALUES ($1, $2, TRUE) 
+                ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason
+            """, ip, reason)
     except Exception as e: 
         print(f"DB Ban Insert Error: {e}")
 
@@ -272,13 +274,10 @@ async def websocket_monitor(websocket: WebSocket):
             return
         while True:
             data = await websocket.receive_json()
-            raw_image_data = data.get("image", "")
-            img = decode_base64_image(raw_image_data)
+            img = decode_base64_image(data.get("image", ""))
             user_gender = data.get("gender", "male").lower()
             current_room = next((user_rooms.get(ws) for ws, ip in client_ips.items() if ip == client_ip), None)
-            
-            # Pass the raw base64 string directly into the queue
-            await ai_task_queue.put((client_ip, websocket, user_gender, current_room, img, raw_image_data))
+            await ai_task_queue.put((client_ip, websocket, user_gender, current_room, img))
     except Exception: pass
 
 @app.websocket("/ws/chat/{gender}")
@@ -304,8 +303,7 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 await websocket.close()
                 return
             
-            raw_image_data = init_data.get("image", "")
-            img = decode_base64_image(raw_image_data)
+            img = decode_base64_image(init_data.get("image", ""))
             
             async with ai_semaphore:
                 face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
@@ -318,8 +316,7 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 return
 
             if is_kid or is_nudity:
-                # Capture the raw image to database directly on start violation
-                await ban_user(client_ip, "Policy violation detected on connection.", raw_image_data)
+                await ban_user(client_ip, "Policy violation detected on connection.")
                 await websocket.send_json({"type": "error", "payload": "⛔ Banned: Policy violation."})
                 await websocket.close()
                 return
