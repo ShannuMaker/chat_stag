@@ -339,7 +339,7 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 await partner_ws.send_json({"type": "match_start", "role": "receiver", "partner_gender": "Male"})
             else:
                 waiting_males.append(websocket)
-                await websocket.send_json({"type": "status", "payload": "Searching for a female user..."})
+                await websocket.send_json({"type": "status", "payload": "Searching for a user..."})
         else:
             if waiting_males:
                 partner_ws = waiting_males.pop(0)
