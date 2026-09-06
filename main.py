@@ -208,7 +208,13 @@ async def execute_ban(client_ip, ws, room_id, reason):
 async def startup():
     global db_pool
     try:
-        db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0, max_inactive_connection_lifetime=300)
+        # Added min_size=0 to gracefully handle serverless DB connection drops
+        db_pool = await asyncpg.create_pool(
+            DB_URL, 
+            statement_cache_size=0, 
+            max_inactive_connection_lifetime=300,
+            min_size=0 
+        )
         async with db_pool.acquire() as conn:
             await conn.execute('CREATE TABLE IF NOT EXISTS banned_ips (ip VARCHAR(255) PRIMARY KEY, reason TEXT, is_banned BOOLEAN DEFAULT TRUE)')
             await conn.execute('CREATE TABLE IF NOT EXISTS ads (id SERIAL PRIMARY KEY, ad_content TEXT, is_active BOOLEAN DEFAULT TRUE)')
@@ -220,29 +226,40 @@ async def shutdown():
     if db_pool: await db_pool.close()
     for worker in workers: worker.cancel()
 
-# Strictly checks bans via Database Only
+# Strictly checks bans via Database Only with retry logic
 async def is_banned(ip: str):
     if not db_pool: return None
-    try:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT reason FROM banned_ips WHERE ip = $1 AND is_banned = TRUE", ip)
-            return row["reason"] if row else None
-    except Exception as e:
-        print(f"DB Ban Check Error: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT reason FROM banned_ips WHERE ip = $1 AND is_banned = TRUE", ip)
+                return row["reason"] if row else None
+        except Exception as e:
+            if "connection was closed" in str(e).lower() and attempt < 2:
+                await asyncio.sleep(0.1)
+                continue
+            print(f"DB Ban Check Error: {e}")
+            return None
+    return None
 
-# Strictly issues bans via Database Only
+# Strictly issues bans via Database Only with retry logic
 async def ban_user(ip: str, reason: str):
     if not db_pool: return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO banned_ips (ip, reason, is_banned) 
-                VALUES ($1, $2, TRUE) 
-                ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason
-            """, ip, reason)
-    except Exception as e: 
-        print(f"DB Ban Insert Error: {e}")
+    for attempt in range(3):
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO banned_ips (ip, reason, is_banned) 
+                    VALUES ($1, $2, TRUE) 
+                    ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason
+                """, ip, reason)
+                break
+        except Exception as e: 
+            if "connection was closed" in str(e).lower() and attempt < 2:
+                await asyncio.sleep(0.1)
+                continue
+            print(f"DB Ban Insert Error: {e}")
+            break
 
 waiting_males, waiting_females = [], []
 active_rooms, user_rooms, client_ips = {}, {}, {}
@@ -298,7 +315,7 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 return
             
             img = decode_base64_image(init_data.get("image", ""))
-            face_found, is_kid, is_nudity, gender_mismatch = await loop.run_in_executor(None, analyze_frame, img, user_gender)
+            face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
 
             if not face_found:
                 await websocket.send_json({"type": "error", "payload": "❌ No human face detected."})
@@ -311,7 +328,7 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 await websocket.close()
                 return
 
-            if gender_mismatch and predicted_gender != "unknown":
+            if predicted_gender != user_gender and predicted_gender != "unknown":
                 await websocket.send_json({"type": "gender_mismatch", "payload": "⚠️ Warning: Detected gender does not match selection."})
 
             is_verified = True
