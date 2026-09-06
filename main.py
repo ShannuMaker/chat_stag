@@ -8,33 +8,28 @@ import cv2
 import datetime
 import asyncpg
 import asyncio
-import threading
-import traceback
+import gc
 from typing import Dict, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 
 if int(cv2.__version__.split(".")[0]) >= 5:
-    raise RuntimeError("OpenCV 5.0+ dropped Caffe model support. Downgrade your environment: pip uninstall opencv-python -y && pip install 'opencv-python<5.0.0'")
+    raise RuntimeError("OpenCV 5.0+ dropped Caffe model support. Downgrade your environment.")
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 app = FastAPI()
 
-# Database
 DB_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_WyXHEifS04bx@ep-broad-sunset-a553unbb-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
 db_pool = None
 ai_task_queue = asyncio.Queue()
 workers = []
+ai_semaphore = asyncio.Semaphore(1)
 
-FACE_PROTO = "deploy.prototxt"
-FACE_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
-GENDER_PROTO = "gender_deploy.prototxt"
-GENDER_MODEL = "gender_net.caffemodel"
-AGE_PROTO = "age_deploy.prototxt"
-AGE_MODEL = "age_net.caffemodel"
+FACE_PROTO, FACE_MODEL = "deploy.prototxt", "res10_300x300_ssd_iter_140000.caffemodel"
+GENDER_PROTO, GENDER_MODEL = "gender_deploy.prototxt", "gender_net.caffemodel"
+AGE_PROTO, AGE_MODEL = "age_deploy.prototxt", "age_net.caffemodel"
 
 MODEL_URLS = {
     FACE_PROTO: "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt",
@@ -47,25 +42,17 @@ MODEL_URLS = {
 
 for file_name, url in MODEL_URLS.items():
     if not os.path.exists(file_name):
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(file_name, 'wb') as out_file:
-                out_file.write(response.read())
-        except Exception as e:
-            print(f"Failed to download {file_name}: {e}")
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response, open(file_name, 'wb') as out_file:
+            out_file.write(response.read())
 
-thread_local = threading.local()
-
-def get_ai_models():
-    if not hasattr(thread_local, "models_initialized"):
-        thread_local.face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
-        thread_local.gender_net = cv2.dnn.readNet(GENDER_MODEL, GENDER_PROTO)
-        thread_local.age_net = cv2.dnn.readNet(AGE_MODEL, AGE_PROTO)
-        for net in [thread_local.face_net, thread_local.gender_net, thread_local.age_net]:
-            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-        thread_local.models_initialized = True
-    return thread_local
+# Load models ONCE globally to fix memory duplication limit
+face_net = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
+gender_net = cv2.dnn.readNet(GENDER_MODEL, GENDER_PROTO)
+age_net = cv2.dnn.readNet(AGE_MODEL, AGE_PROTO)
+for net in [face_net, gender_net, age_net]:
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
 def decode_base64_image(base64_str: str):
     try:
@@ -76,46 +63,15 @@ def decode_base64_image(base64_str: str):
     except Exception:
         return None
 
-# --- DB ERROR LOGGING SYSTEM ---
-class ErrorLog(BaseModel):
-    source: str
-    message: str
-    details: str = ""
-
-async def log_error_to_db(source: str, message: str, details: str = "", ip: str = "unknown"):
-    if not db_pool:
-        print(f"[{source}] {message} - {details}")
-        return
-    for attempt in range(3):
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO error_logs (timestamp, source, message, details, ip) 
-                    VALUES (NOW(), $1, $2, $3, $4)
-                """, source, str(message), str(details), ip)
-                break
-        except Exception as e:
-            if "connection was closed" in str(e).lower() and attempt < 2:
-                await asyncio.sleep(0.1)
-                continue
-            print(f"Failed to log error to DB: {e}")
-            break
-
-@app.post("/api/log_error")
-async def api_log_error(log: ErrorLog, request: Request):
-    client_ip = request.client.host
-    await log_error_to_db(log.source, log.message, log.details, client_ip)
-    return {"status": "logged"}
-
 def analyze_frame(img, user_gender):
-    if img is None: return False, False, False, "unknown", "Image decoding failed or was None."
+    if img is None: return False, False, False, "unknown"
     try:
-        models = get_ai_models()
+        global face_net, gender_net, age_net
         h, w = img.shape[:2]
         
         blob_face = cv2.dnn.blobFromImage(img, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False, crop=False)
-        models.face_net.setInput(blob_face)
-        detections = models.face_net.forward()
+        face_net.setInput(blob_face)
+        detections = face_net.forward()
         
         face_found = False
         best_box = None
@@ -144,13 +100,24 @@ def analyze_frame(img, user_gender):
             if face_crop.size > 0:
                 blob = cv2.dnn.blobFromImage(face_crop, 1.0, (227, 227), (78.4, 87.8, 114.9), swapRB=False)
                 
-                models.age_net.setInput(blob)
-                age_preds = models.age_net.forward()[0]
+                age_net.setInput(blob)
+                age_preds = age_net.forward()[0]
                 minor_prob = float(np.sum(age_preds[0:3]))
                 is_kid = bool(minor_prob > 0.50)
                 
-                models.gender_net.setInput(blob)
-                predicted_gender = "male" if models.gender_net.forward()[0].argmax() == 0 else "female"
+                gender_net.setInput(blob)
+                gender_preds = gender_net.forward()[0]
+                
+                # Apply 65% certainty threshold to fix false gender detections
+                male_conf = float(gender_preds[0])
+                female_conf = float(gender_preds[1])
+                
+                if male_conf > 0.65:
+                    predicted_gender = "male"
+                elif female_conf > 0.65:
+                    predicted_gender = "female"
+                else:
+                    predicted_gender = user_gender
             
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_skin = np.array([0, 45, 80], dtype=np.uint8)
@@ -158,15 +125,14 @@ def analyze_frame(img, user_gender):
         mask = cv2.inRange(hsv, lower_skin, upper_skin)
         
         if face_found:
-            mask[y1:y2, x1:x2] = 0
+            mask[y1:y2, x1:x2] = 0 
         
         skin_ratio = np.sum(mask > 0) / (h * w)
         is_nudity = bool(skin_ratio > 0.60) 
         
-        return face_found, is_kid, is_nudity, predicted_gender, None
-    except Exception as e:
-        err_details = traceback.format_exc()
-        return False, False, False, "unknown", f"Exception in analyze_frame: {str(e)}\n{err_details}"
+        return face_found, is_kid, is_nudity, predicted_gender
+    except Exception:
+        return False, False, False, "unknown"
 
 async def ai_background_worker():
     loop = asyncio.get_running_loop()
@@ -179,11 +145,11 @@ async def ai_background_worker():
                 ai_task_queue.task_done()
                 continue
 
-            face_found, is_kid, is_nudity, predicted_gender, err = await loop.run_in_executor(None, analyze_frame, img, user_gender)
+            async with ai_semaphore:
+                face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
+                del img
+                gc.collect()
             
-            if err:
-                await log_error_to_db("ai_background_worker", "OpenCV Inference Error", err, client_ip)
-
             status_text = "No Face"
             if is_nudity:
                 status_text = "Nudity Detected"
@@ -194,8 +160,8 @@ async def ai_background_worker():
 
             try:
                 await ws.send_json({"type": "ai_status", "payload": f"AI: {status_text}"})
-            except Exception as e:
-                await log_error_to_db("ai_ws_send", f"Status Send Error: {e}", traceback.format_exc(), client_ip)
+            except Exception:
+                pass
 
             if is_nudity:
                 await execute_ban(client_ip, ws, room_id, "Explicit/Nudity content detected.")
@@ -211,8 +177,7 @@ async def ai_background_worker():
             ai_task_queue.task_done()
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            await log_error_to_db("ai_task_queue", f"Worker Crash: {e}", traceback.format_exc())
+        except Exception:
             ai_task_queue.task_done()
 
 async def execute_ban(client_ip, ws, room_id, reason):
@@ -244,23 +209,11 @@ async def execute_ban(client_ip, ws, room_id, reason):
 async def startup():
     global db_pool
     try:
-        db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0, max_inactive_connection_lifetime=300, min_size=0)
+        db_pool = await asyncpg.create_pool(DB_URL, statement_cache_size=0, max_inactive_connection_lifetime=300)
         async with db_pool.acquire() as conn:
             await conn.execute('CREATE TABLE IF NOT EXISTS banned_ips (ip VARCHAR(255) PRIMARY KEY, reason TEXT, is_banned BOOLEAN DEFAULT TRUE)')
             await conn.execute('CREATE TABLE IF NOT EXISTS ads (id SERIAL PRIMARY KEY, ad_content TEXT, is_active BOOLEAN DEFAULT TRUE)')
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS error_logs (
-                    id SERIAL PRIMARY KEY,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    source VARCHAR(100),
-                    message TEXT,
-                    details TEXT,
-                    ip VARCHAR(255)
-                )
-            ''')
-    except Exception as e:
-        print(f"Database Initialization Error: {e}")
-        
+    except Exception: pass
     for _ in range(4): workers.append(asyncio.create_task(ai_background_worker()))
 
 @app.on_event("shutdown")
@@ -270,36 +223,31 @@ async def shutdown():
 
 async def is_banned(ip: str):
     if not db_pool: return None
-    for attempt in range(3):
-        try:
-            async with db_pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT reason FROM banned_ips WHERE ip = $1 AND is_banned = TRUE", ip)
-                return row["reason"] if row else None
-        except Exception as e:
-            if attempt == 2: await log_error_to_db("db_is_banned", str(e), traceback.format_exc(), ip)
-            await asyncio.sleep(0.1)
-    return None
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT reason FROM banned_ips WHERE ip = $1 AND is_banned = TRUE", ip)
+            return row["reason"] if row else None
+    except Exception as e:
+        print(f"DB Ban Check Error: {e}")
+        return None
 
 async def ban_user(ip: str, reason: str):
     if not db_pool: return
-    for attempt in range(3):
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO banned_ips (ip, reason, is_banned) 
-                    VALUES ($1, $2, TRUE) 
-                    ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason
-                """, ip, reason)
-                break
-        except Exception as e: 
-            if attempt == 2: await log_error_to_db("db_ban_user", str(e), traceback.format_exc(), ip)
-            await asyncio.sleep(0.1)
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO banned_ips (ip, reason, is_banned) 
+                VALUES ($1, $2, TRUE) 
+                ON CONFLICT (ip) DO UPDATE SET is_banned = TRUE, reason = EXCLUDED.reason
+            """, ip, reason)
+    except Exception as e: 
+        print(f"DB Ban Insert Error: {e}")
 
 waiting_males, waiting_females = [], []
 active_rooms, user_rooms, client_ips = {}, {}, {}
 SCAM_WORDS = ["crypto", "invest", "cashapp", "venmo", "telegram", "whatsapp", "paypal", "bitcoin", "scam", "hack"]
 
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 async def serve_frontend():
     if os.path.exists("index.html"):
         with open("index.html", "r", encoding="utf-8") as f: return HTMLResponse(content=f.read())
@@ -323,8 +271,7 @@ async def websocket_monitor(websocket: WebSocket):
             user_gender = data.get("gender", "male").lower()
             current_room = next((user_rooms.get(ws) for ws, ip in client_ips.items() if ip == client_ip), None)
             await ai_task_queue.put((client_ip, websocket, user_gender, current_room, img))
-    except Exception as e:
-        await log_error_to_db("websocket_monitor", str(e), traceback.format_exc(), client_ip)
+    except Exception: pass
 
 @app.websocket("/ws/chat/{gender}")
 async def websocket_chat(websocket: WebSocket, gender: str):
@@ -350,10 +297,11 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                 return
             
             img = decode_base64_image(init_data.get("image", ""))
-            face_found, is_kid, is_nudity, predicted_gender, err = await loop.run_in_executor(None, analyze_frame, img, user_gender)
-
-            if err:
-                await log_error_to_db("verify_analyze_frame", "Inference Error on Verify", err, client_ip)
+            
+            async with ai_semaphore:
+                face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
+                del img
+                gc.collect()
 
             if not face_found:
                 await websocket.send_json({"type": "error", "payload": "❌ No human face detected."})
@@ -429,8 +377,7 @@ async def websocket_chat(websocket: WebSocket, gender: str):
                         await client.close()
                 await websocket.send_json({"type": "peer_disconnected"})
                 break
-    except Exception as e:
-        await log_error_to_db("websocket_chat", str(e), traceback.format_exc(), client_ip)
+    except Exception:
         if websocket in waiting_males: waiting_males.remove(websocket)
         if websocket in waiting_females: waiting_females.remove(websocket)
         client_ips.pop(websocket, None)
