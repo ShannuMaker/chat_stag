@@ -16,7 +16,6 @@ idna==3.19
 kiwisolver==1.5.1
 matplotlib==3.11.1
 mediapipe==1.0.1
-msvc_runtime==14.44.35112
 numpy==2.5.2
 opencv-python==4.14.0.94
 packaging==26.3
