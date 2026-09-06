@@ -1,6 +1,6 @@
-opencv-python==4.8.1.78
-opencv-contrib-python==4.8.1.78
 fastapi
-uvicorn
-asyncpg
+websockets
+uvicorn[standard]
+opencv-python-headless<5.0
 numpy
+asyncpg
