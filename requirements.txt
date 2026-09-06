@@ -1,6 +1,6 @@
 fastapi
-websockets
 uvicorn[standard]
-opencv-python-headless<5.0
-numpy
+websockets
 asyncpg
+numpy<2.0.0
+opencv-python==4.8.1.78
